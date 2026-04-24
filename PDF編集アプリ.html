@@ -1,0 +1,473 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>PDF Mixer (図面OCR ＋ 個別ダウンロード対応版)</title>
+  
+  <script src="https://cdn.tailwindcss.com"></script>
+  
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+  <script>pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';</script>
+  <script src="https://unpkg.com/pdf-lib@1.17.1/dist/pdf-lib.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/Sortable/1.15.0/Sortable.min.js"></script>
+  
+  <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
+</head>
+<body class="bg-slate-50 text-slate-800 font-sans pb-40">
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    function App() {
+      const [pages, setPages] = useState([]);
+      const [isProcessing, setIsProcessing] = useState(false);
+      const [generatedFile, setGeneratedFile] = useState(null);
+      
+      // モーダル用のステート
+      const [modalOpen, setModalOpen] = useState(false);
+      const [targetPage, setTargetPage] = useState(null);
+      const [selection, setSelection] = useState(null);
+      const [isSelecting, setIsSelecting] = useState(false);
+      const [tempFileName, setTempFileName] = useState('');
+      const [isReadingAi, setIsReadingAi] = useState(false); // 読み取り中フラグ
+
+      const fileStorageRef = useRef({});
+      const pdfDocCacheRef = useRef(new Map());
+      const gridRef = useRef(null);
+      const sortableRef = useRef(null);
+      
+      const selectionStartRef = useRef({ x: 0, y: 0 });
+      const previewImageRef = useRef(null);
+
+      useEffect(() => {
+        if (!gridRef.current || !window.Sortable) return;
+        if (sortableRef.current) sortableRef.current.destroy();
+
+        sortableRef.current = new window.Sortable(gridRef.current, {
+          animation: 150,
+          ghostClass: 'bg-blue-100',
+          delay: 100,
+          delayOnTouchOnly: true,
+          onEnd: (evt) => {
+            const { oldIndex, newIndex } = evt;
+            if (oldIndex === newIndex) return;
+            setPages((current) => {
+              const next = [...current];
+              const [moved] = next.splice(oldIndex, 1);
+              next.splice(newIndex, 0, moved);
+              return next;
+            });
+          },
+        });
+      }, [pages]);
+
+      const generateId = () => Math.random().toString(36).substring(2) + Date.now().toString(36);
+
+      const handleFileUpload = async (event) => {
+        const files = Array.from(event.target.files || []);
+        if (files.length === 0) return;
+
+        setIsProcessing(true);
+        if (generatedFile) {
+          URL.revokeObjectURL(generatedFile.url);
+          setGeneratedFile(null);
+        }
+
+        try {
+          const newPages = [];
+          for (let i = 0; i < files.length; i++) {
+            const file = files[i];
+            const fileId = generateId();
+            
+            const arrayBuffer = await file.arrayBuffer();
+            fileStorageRef.current[fileId] = new Uint8Array(arrayBuffer);
+
+            const loadTask = window.pdfjsLib.getDocument(fileStorageRef.current[fileId].slice(0));
+            const pdfDoc = await loadTask.promise;
+            
+            for (let pageNum = 1; pageNum <= pdfDoc.numPages; pageNum++) {
+              const page = await pdfDoc.getPage(pageNum);
+              const viewport = page.getViewport({ scale: 0.5 });
+              
+              const canvas = document.createElement('canvas');
+              const context = canvas.getContext('2d');
+              canvas.height = viewport.height;
+              canvas.width = viewport.width;
+
+              await page.render({ canvasContext: context, viewport: viewport }).promise;
+              
+              const baseName = file.name.replace(/\.[^/.]+$/, "");
+              
+              newPages.push({
+                id: generateId(),
+                thumbnail: canvas.toDataURL('image/jpeg', 0.8),
+                fileId: fileId,
+                pageIndex: pageNum - 1,
+                fileName: baseName,
+                rotation: 0
+              });
+              page.cleanup();
+            }
+            pdfDoc.cleanup();
+          }
+          setPages(prev => [...prev, ...newPages]);
+        } catch (error) {
+          alert(`読み込みエラー: ${error.message}`);
+        } finally {
+          setIsProcessing(false);
+          event.target.value = '';
+        }
+      };
+
+      const removePage = (index) => setPages(pages.filter((_, i) => i !== index));
+      const rotatePage = (index) => setPages(pages.map((p, i) => i === index ? { ...p, rotation: (p.rotation + 90) % 360 } : p));
+      const handleRename = (index, newName) => setPages(pages.map((p, i) => i === index ? { ...p, fileName: newName } : p));
+
+      const downloadSinglePage = async (e, page) => {
+        e.stopPropagation();
+        if (!window.PDFLib) return;
+        setIsProcessing(true);
+        
+        try {
+          const { PDFDocument, degrees } = window.PDFLib;
+          const newPdf = await PDFDocument.create();
+          const sourceData = fileStorageRef.current[page.fileId];
+          if (!sourceData) throw new Error("ページデータが見つかりません");
+          
+          const sourcePdfDoc = await PDFDocument.load(sourceData.slice(0));
+          const [copiedPage] = await newPdf.copyPages(sourcePdfDoc, [page.pageIndex]);
+          
+          if (page.rotation !== 0) {
+            const currentAngle = copiedPage.getRotation().angle;
+            copiedPage.setRotation(degrees(currentAngle + page.rotation));
+          }
+          
+          newPdf.addPage(copiedPage);
+          const pdfBytes = await newPdf.save();
+          const blob = new Blob([pdfBytes], { type: 'application/pdf' });
+          
+          let filename = page.fileName || 'document';
+          if (!filename.toLowerCase().endsWith('.pdf')) filename += '.pdf';
+          
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = filename;
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
+          setTimeout(() => URL.revokeObjectURL(url), 1000);
+        } catch (error) {
+          alert(`エラー: ${error.message}`);
+        } finally {
+          setIsProcessing(false);
+        }
+      };
+
+      const prepareDownload = async () => {
+        if (pages.length === 0) return;
+        setIsProcessing(true);
+        await new Promise(r => setTimeout(r, 50));
+
+        try {
+          const { PDFDocument, degrees } = window.PDFLib;
+          const mergedPdf = await PDFDocument.create();
+          pdfDocCacheRef.current.clear();
+
+          for (let i = 0; i < pages.length; i++) {
+            const p = pages[i];
+            const sourceData = fileStorageRef.current[p.fileId];
+            let sourcePdfDoc = pdfDocCacheRef.current.get(p.fileId);
+            if (!sourcePdfDoc) {
+              sourcePdfDoc = await PDFDocument.load(sourceData.slice(0));
+              pdfDocCacheRef.current.set(p.fileId, sourcePdfDoc);
+            }
+            const [copiedPage] = await mergedPdf.copyPages(sourcePdfDoc, [p.pageIndex]);
+            if (p.rotation !== 0) copiedPage.setRotation(degrees(copiedPage.getRotation().angle + p.rotation));
+            mergedPdf.addPage(copiedPage);
+          }
+          const pdfBytes = await mergedPdf.save();
+          const blob = new Blob([pdfBytes], { type: 'application/pdf' });
+          const url = URL.createObjectURL(blob);
+          setGeneratedFile({ url, blob, filename: `merged_${Date.now()}.pdf` });
+        } catch (e) {
+          alert(`生成エラー: ${e.message}`);
+        } finally {
+          setIsProcessing(false);
+        }
+      };
+
+      // --- モーダル・OCR（文字読み取り）機能 ---
+      const openModal = async (page, index) => {
+        setIsProcessing(true);
+        try {
+          const sourceData = fileStorageRef.current[page.fileId];
+          const loadTask = window.pdfjsLib.getDocument(sourceData.slice(0));
+          const pdfDoc = await loadTask.promise;
+          const pdfPage = await pdfDoc.getPage(page.pageIndex + 1);
+          
+          const viewport = pdfPage.getViewport({ scale: 2.0, rotation: page.rotation });
+          const canvas = document.createElement('canvas');
+          const context = canvas.getContext('2d');
+          canvas.width = viewport.width;
+          canvas.height = viewport.height;
+          
+          await pdfPage.render({ canvasContext: context, viewport: viewport }).promise;
+          
+          setTargetPage({ ...page, index, highResImage: canvas.toDataURL('image/png') });
+          setTempFileName(page.fileName);
+          setSelection(null);
+          setModalOpen(true);
+        } catch (err) {
+          alert("画像の読み込みに失敗しました");
+        } finally {
+          setIsProcessing(false);
+        }
+      };
+
+      const handleMouseDown = (e) => {
+        if (!previewImageRef.current) return;
+        e.preventDefault();
+        const rect = previewImageRef.current.getBoundingClientRect();
+        const x = e.clientX - rect.left;
+        const y = e.clientY - rect.top;
+        selectionStartRef.current = { x, y };
+        setIsSelecting(true);
+        setSelection({ x, y, width: 0, height: 0 });
+      };
+
+      const handleMouseMove = (e) => {
+        if (!isSelecting || !previewImageRef.current) return;
+        const rect = previewImageRef.current.getBoundingClientRect();
+        const currentX = e.clientX - rect.left;
+        const currentY = e.clientY - rect.top;
+        const startX = selectionStartRef.current.x;
+        const startY = selectionStartRef.current.y;
+        
+        const width = Math.abs(currentX - startX);
+        const height = Math.abs(currentY - startY);
+        const x = Math.min(currentX, startX);
+        const y = Math.min(currentY, startY);
+
+        setSelection({ 
+          x: Math.max(0, x), y: Math.max(0, y), 
+          width: Math.min(width, rect.width - x), height: Math.min(height, rect.height - y) 
+        });
+      };
+
+      const handleMouseUp = () => setIsSelecting(false);
+
+      const saveModalData = () => {
+        handleRename(targetPage.index, tempFileName);
+        setModalOpen(false);
+      };
+
+      // Tesseract.js による文字の自動読み取り
+      const executeOCR = async () => {
+        if (!selection || selection.width < 10 || selection.height < 10) {
+          alert("文字を読み取る範囲を赤枠で囲んでください");
+          return;
+        }
+        setIsReadingAi(true);
+
+        try {
+          const img = new Image();
+          img.src = targetPage.highResImage;
+          await new Promise(r => img.onload = r);
+
+          const previewRect = previewImageRef.current.getBoundingClientRect();
+          const scaleX = img.width / previewRect.width;
+          const scaleY = img.height / previewRect.height;
+
+          const cropCanvas = document.createElement('canvas');
+          cropCanvas.width = selection.width * scaleX;
+          cropCanvas.height = selection.height * scaleY;
+          const ctx = cropCanvas.getContext('2d');
+
+          ctx.drawImage(
+            img,
+            selection.x * scaleX, selection.y * scaleY,
+            selection.width * scaleX, selection.height * scaleY,
+            0, 0,
+            cropCanvas.width, cropCanvas.height
+          );
+
+          const base64 = cropCanvas.toDataURL('image/png');
+
+          // 日本語＋英語（数字など）モードで認識
+          const result = await Tesseract.recognize(base64, 'jpn+eng');
+          
+          // 空白やファイル名に使えない記号を取り除く
+          let text = result.data.text.replace(/\s+/g, '').replace(/[\\/:*?"<>|]/g, '_').trim();
+          
+          if (text) {
+            setTempFileName(text);
+          } else {
+            alert("文字を認識できませんでした。もう少し広く囲むか、手打ちで入力してください。");
+          }
+        } catch (err) {
+          console.error(err);
+          alert("文字の読み取りに失敗しました。");
+        } finally {
+          setIsReadingAi(false);
+          setSelection(null); // 読み取った後は枠を消す
+        }
+      };
+
+      return (
+        <div>
+          <header className="bg-white border-b border-slate-200 px-4 py-3 sticky top-0 z-20 shadow-sm flex items-center justify-between">
+            <h1 className="text-lg font-bold flex items-center gap-2">📄 PDF Mixer</h1>
+            <div className="flex gap-2">
+              <label className="flex items-center gap-2 bg-slate-100 hover:bg-slate-200 text-slate-700 px-4 py-2 rounded-lg cursor-pointer font-bold text-sm">
+                ➕ 追加
+                <input type="file" multiple accept=".pdf" className="hidden" onChange={handleFileUpload} disabled={isProcessing} />
+              </label>
+              <button onClick={prepareDownload} disabled={pages.length === 0 || isProcessing} className="flex items-center gap-2 px-4 py-2 rounded-lg font-bold text-sm bg-blue-600 hover:bg-blue-700 text-white disabled:bg-slate-300">
+                ⬇️ 全て結合して作成
+              </button>
+            </div>
+          </header>
+
+          <main className="p-4 md:p-6 max-w-7xl mx-auto">
+            {generatedFile && !isProcessing && (
+              <div className="mb-8 p-6 bg-green-50 border-2 border-green-200 rounded-xl shadow-lg text-center">
+                <h2 className="text-xl font-bold text-green-900 mb-4">✅ 作成完了！</h2>
+                <a href={generatedFile.url} download={generatedFile.filename} className="inline-block bg-green-600 hover:bg-green-700 text-white font-bold py-3 px-8 rounded-xl shadow-md">
+                  💾 パソコンに保存する
+                </a>
+              </div>
+            )}
+
+            {pages.length === 0 && !isProcessing && (
+              <div className="mt-8 flex flex-col items-center justify-center text-center border-2 border-dashed border-slate-300 rounded-2xl p-10 bg-slate-50">
+                <h3 className="text-xl font-bold text-slate-700">PDFをドラッグ＆ドロップ、または追加してください</h3>
+              </div>
+            )}
+
+            {pages.length > 0 && (
+              <div>
+                <div className="flex justify-between items-center mb-4 px-2">
+                  <span className="text-sm font-bold text-slate-600">全 {pages.length} ページ</span>
+                  <button onClick={() => setPages([])} className="text-xs text-red-500 hover:underline">すべて削除</button>
+                </div>
+                
+                <div ref={gridRef} className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 gap-4">
+                  {pages.map((page, index) => (
+                    <div key={page.id} className="relative bg-white border border-slate-200 rounded-lg overflow-hidden shadow-sm hover:shadow-md select-none group">
+                      <div className="absolute top-1 right-1 z-20 flex gap-1">
+                        <button onClick={(e) => downloadSinglePage(e, page)} className="p-1 bg-white/90 rounded shadow hover:bg-green-100" title="このページだけをダウンロード">⬇️</button>
+                        <button onClick={() => openModal(page, index)} className="p-1 bg-white/90 rounded shadow hover:bg-blue-100" title="図面を拡大して確認/選択">🔍</button>
+                        <button onClick={() => rotatePage(index)} className="p-1 bg-white/90 rounded shadow hover:bg-slate-100" title="回転">🔄</button>
+                        <button onClick={() => removePage(index)} className="p-1 bg-white/90 rounded shadow hover:bg-red-100" title="削除">❌</button>
+                      </div>
+                      <div className="absolute top-1 left-1 z-10 bg-slate-800/80 text-white text-[10px] px-1.5 rounded">{index+1}</div>
+                      
+                      <div className="p-2 aspect-[3/4] flex items-center justify-center bg-slate-100">
+                        <img src={page.thumbnail} className="max-w-full max-h-full object-contain pointer-events-none" style={{transform:`rotate(${page.rotation}deg)`}} />
+                      </div>
+                      
+                      <div className="px-2 py-2 bg-white border-t border-slate-100">
+                        <input 
+                          type="text" 
+                          value={page.fileName} 
+                          onChange={(e) => handleRename(index, e.target.value)} 
+                          className="w-full text-xs text-center border-b border-transparent hover:border-slate-300 focus:border-blue-500 focus:outline-none bg-transparent"
+                          placeholder="ファイル名を入力"
+                        />
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </main>
+
+          {/* 図面拡大・選択モーダル */}
+          {modalOpen && targetPage && (
+            <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-4" onClick={() => setModalOpen(false)}>
+              <div className="bg-white rounded-xl shadow-2xl overflow-hidden max-w-4xl w-full max-h-[90vh] flex flex-col" onClick={e => e.stopPropagation()}>
+                
+                <div className="p-3 border-b flex justify-between items-center bg-slate-50">
+                  <h3 className="font-bold text-slate-800">🔍 図面の確認とファイル名の入力</h3>
+                  <button onClick={() => setModalOpen(false)} className="text-xl leading-none text-slate-500 hover:text-black">×</button>
+                </div>
+                
+                <div className="flex-1 overflow-auto p-4 bg-slate-200 flex items-center justify-center relative select-none">
+                  <div className="relative shadow-lg inline-block cursor-crosshair">
+                    <img 
+                      ref={previewImageRef}
+                      src={targetPage.highResImage} 
+                      className="max-w-full max-h-[60vh] object-contain block"
+                      draggable={false}
+                      onMouseDown={handleMouseDown}
+                      onMouseMove={handleMouseMove}
+                      onMouseUp={handleMouseUp}
+                      onMouseLeave={handleMouseUp}
+                    />
+                    {selection && (
+                      <div 
+                        className="absolute border-2 border-red-500 bg-red-500/30 pointer-events-none"
+                        style={{ left: selection.x, top: selection.y, width: selection.width, height: selection.height }}
+                      />
+                    )}
+                  </div>
+                </div>
+                
+                <div className="p-4 border-t bg-white flex flex-col gap-3">
+                  {/* OCR（読み取り）ボタン */}
+                  <div className="flex items-center gap-3">
+                    <button 
+                      onClick={executeOCR} 
+                      disabled={isReadingAi || !selection}
+                      className="flex items-center gap-2 px-4 py-2 bg-indigo-100 hover:bg-indigo-200 text-indigo-800 rounded-lg font-bold text-sm disabled:opacity-50 transition-opacity"
+                    >
+                      {isReadingAi ? "⏳ 読み取り中..." : "🎯 赤枠で囲んだ文字を読み取る"}
+                    </button>
+                    <span className="text-xs text-slate-500 hidden sm:inline">
+                      ※図番を赤枠で囲んでからボタンを押してください
+                    </span>
+                  </div>
+
+                  <div className="flex flex-col sm:flex-row gap-3 items-center">
+                    <div className="flex-1 w-full flex items-center gap-2">
+                      <span className="text-sm font-bold whitespace-nowrap">ファイル名:</span>
+                      <input 
+                        type="text" 
+                        value={tempFileName}
+                        onChange={(e) => setTempFileName(e.target.value)}
+                        className="flex-1 border border-slate-300 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500 text-lg font-medium"
+                        placeholder="自動入力、または手打ち..."
+                      />
+                    </div>
+                    <div className="flex gap-2 w-full sm:w-auto">
+                      <button onClick={() => setModalOpen(false)} className="px-4 py-2 bg-slate-100 hover:bg-slate-200 rounded-lg font-bold text-slate-700">キャンセル</button>
+                      <button onClick={saveModalData} className="px-6 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-bold shadow-md">保存</button>
+                    </div>
+                  </div>
+                </div>
+
+              </div>
+            </div>
+          )}
+          
+          {isProcessing && (
+            <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center">
+              <div className="bg-white p-6 rounded-xl font-bold text-slate-700">⏳ 処理中...</div>
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>
